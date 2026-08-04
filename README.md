@@ -2,6 +2,7 @@
 Easy quant comfyUI origin models to gguf , and esay use it, save more disk...
 
 # Tips
+* add gguf clip support
 * find it in model/loader,replace the original unet_loader to gguf_loader
 * 节点在模型/加载目录下,对于大部分单unet加载的,替换原始unet加载器为gguf加载器即可,hidream-O1 暂时未支持 
 
