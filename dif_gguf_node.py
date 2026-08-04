@@ -9,6 +9,7 @@ from comfy_api.latest import IO, ComfyExtension
 
 import comfy
 import comfy.utils
+import comfy.sd
 import comfy.model_management
 import comfy.model_detection
 import comfy.model_patcher
@@ -27,6 +28,7 @@ def update_folder_names_and_paths(key, targets=[]):
 
 # Add a custom keys for files ending in .gguf
 update_folder_names_and_paths("unet_gguf", ["diffusion_models", "unet"])
+update_folder_names_and_paths("clip_gguf", ["text_encoders", "clip"])
 
 # add gguf folder to comfy optional
 weigths_gguf_current_path = os.path.join(folder_paths.models_dir, "gguf")
@@ -38,6 +40,7 @@ folder_paths.add_model_folder_path("gguf", weigths_gguf_current_path)
 #  Some codes from @city96 https://github.com/city96/ComfyUI-GGUF  and  used for diffusion_gguf model
 import gguf as gguf_lib
 from .ggml_ops import (GGMLTensor, GGMLOps,is_quantized, GGUFModelPatcher)
+from .tokenizer_map import convert_text_encoder_state_dict
 
 
 def get_field(reader, field_name, field_type):
@@ -282,10 +285,150 @@ class Dif_GGUF_Loader(IO.ComfyNode):
         return IO.NodeOutput(model)
 
 
+# ── Text encoder (CLIP) GGUF ────────────────────────────────────────────
+# Mirrors the unet path above, but hands the state dict to ComfyUI's
+# load_text_encoder_state_dicts() with custom_operations=GGMLOps so the
+# quantized tensors stay quantized and are dequantized lazily at forward time.
+# No ComfyUI source file is modified: model_options is a public entry point.
+
+CLIP_GGUF_TYPES = [
+    "stable_diffusion", "stable_cascade", "sd3", "stable_audio", "mochi",
+    "ltxv", "pixart", "cosmos", "lumina2", "wan", "hidream", "chroma", "ace",
+    "omnigen2", "qwen_image", "hunyuan_image", "flux2", "ovis", "longcat_image",
+    "cogvideox", "lens", "pixeldit", "ideogram4", "boogu", "krea2", "joyimage",
+    "mage", "minimax",
+]
+
+CLIP_GGUF_DUAL_TYPES = [
+    "sdxl", "sd3", "flux", "hunyuan_video", "hidream", "hunyuan_image",
+    "hunyuan_video_15", "kandinsky5", "kandinsky5_image", "ltxv", "newbie", "ace",
+]
+
+
+def _clip_gguf_full_path(name):
+    """Resolve a text encoder file from either the gguf or text_encoders folder."""
+    for folder in ("clip_gguf", "gguf", "text_encoders"):
+        try:
+            path = folder_paths.get_full_path(folder, name)
+        except Exception:
+            path = None
+        if path is not None:
+            return path
+    return None
+
+
+def read_text_encoder_gguf(path):
+    """Read a text encoder GGUF and normalize its key names."""
+    sd = read_gguf(path)
+    sd, arch = convert_text_encoder_state_dict(sd)
+    logging.info(f"GGUF TE: {len(sd)} tensors (arch={arch})")
+    return sd
+
+
+def load_text_encoder_gguf(paths, clip_type_name, device="default"):
+    """Load one or more text encoders, any of which may be a .gguf file."""
+    clip_type = getattr(comfy.sd.CLIPType, clip_type_name.upper(),
+                        comfy.sd.CLIPType.STABLE_DIFFUSION)
+
+    state_dicts = []
+    has_quant = False
+    for path in paths:
+        if path.endswith(".gguf"):
+            sd = read_text_encoder_gguf(path)
+            if any(is_quantized(v) for v in sd.values()):
+                has_quant = True
+        else:
+            sd = comfy.utils.load_torch_file(path, safe_load=True)
+        state_dicts.append(sd)
+
+    model_options = {}
+    if device == "cpu":
+        model_options["load_device"] = model_options["offload_device"] = torch.device("cpu")
+    if has_quant:
+        # Public hook: sd1_clip reads model_options["custom_operations"].
+        model_options["custom_operations"] = GGMLOps
+        # GGUF norm tensors are F32, so ComfyUI's t5xxl_detect/llama_detect would
+        # pick float32 as the compute dtype. Force a sane one instead.
+        compute_dtype = comfy.model_management.text_encoder_dtype(
+            comfy.model_management.text_encoder_device()
+        )
+        model_options["dtype_t5"] = compute_dtype
+        model_options["dtype_llama"] = compute_dtype
+
+    clip = comfy.sd.load_text_encoder_state_dicts(
+        state_dicts,
+        embedding_directory=folder_paths.get_folder_paths("embeddings"),
+        clip_type=clip_type,
+        model_options=model_options,
+    )
+
+    if has_quant:
+        clip.patcher = GGUFModelPatcher.clone(clip.patcher)
+        clip.patcher.size = 0
+    return clip
+
+
+class CLIP_GGUF_Loader(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        options = ["none"] + folder_paths.get_filename_list("clip_gguf") \
+                  + folder_paths.get_filename_list("gguf")
+        return IO.Schema(
+            node_id="CLIP_GGUF_Loader",
+            display_name="CLIP_GGUF_Loader",
+            description="Load a text encoder from GGUF (quantized lazy dequant)",
+            category="model/loaders",
+            inputs=[
+                IO.Combo.Input("gguf", options=options),
+                IO.Combo.Input("type", options=CLIP_GGUF_TYPES),
+                IO.Combo.Input("device", options=["default", "cpu"], optional=True),
+            ],
+            outputs=[IO.Clip.Output(display_name="CLIP")],
+        )
+
+    @classmethod
+    def execute(cls, gguf, type="stable_diffusion", device="default") -> IO.NodeOutput:
+        path = _clip_gguf_full_path(gguf) if gguf != "none" else None
+        assert path is not None, f"Text encoder not found: {gguf}"
+        clip = load_text_encoder_gguf([path], type, device)
+        logging.info(f"Loaded text encoder: {type}")
+        return IO.NodeOutput(clip)
+
+
+class DualCLIP_GGUF_Loader(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        options = ["none"] + folder_paths.get_filename_list("clip_gguf") \
+                  + folder_paths.get_filename_list("gguf")
+        return IO.Schema(
+            node_id="DualCLIP_GGUF_Loader",
+            display_name="DualCLIP_GGUF_Loader",
+            description="Load two text encoders, either of which may be GGUF",
+            category="model/loaders",
+            inputs=[
+                IO.Combo.Input("gguf1", options=options),
+                IO.Combo.Input("gguf2", options=options),
+                IO.Combo.Input("type", options=CLIP_GGUF_DUAL_TYPES),
+                IO.Combo.Input("device", options=["default", "cpu"], optional=True),
+            ],
+            outputs=[IO.Clip.Output(display_name="CLIP")],
+        )
+
+    @classmethod
+    def execute(cls, gguf1, gguf2, type="flux", device="default") -> IO.NodeOutput:
+        path1 = _clip_gguf_full_path(gguf1) if gguf1 != "none" else None
+        path2 = _clip_gguf_full_path(gguf2) if gguf2 != "none" else None
+        assert path1 is not None, f"Text encoder not found: {gguf1}"
+        assert path2 is not None, f"Text encoder not found: {gguf2}"
+        clip = load_text_encoder_gguf([path1, path2], type, device)
+        logging.info(f"Loaded dual text encoder: {type}")
+        return IO.NodeOutput(clip)
+
+
 class DifGGUFExtension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[IO.ComfyNode]]:
-        return [Dif_GGUF_Loader,]
+        return [Dif_GGUF_Loader, CLIP_GGUF_Loader, DualCLIP_GGUF_Loader]
 
 async def comfy_entrypoint() -> DifGGUFExtension:
     return DifGGUFExtension()
