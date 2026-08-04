@@ -414,6 +414,14 @@ class GGMLOps(comfy.ops.manual_cast):
             weight, bias = self.cast_bias_weight(input)
             return torch.nn.functional.layer_norm(input, self.normalized_shape, weight, bias, self.eps)
 
+    class RMSNorm(GGMLLayer, comfy.ops.manual_cast.RMSNorm):
+        # Required by T5 / LLaMA / Gemma text encoders.
+        def forward_ggml_cast_weights(self, input):
+            if self.weight is None:
+                return super().forward_comfy_cast_weights(input)
+            weight, _bias = self.cast_bias_weight(input)
+            return torch.nn.functional.rms_norm(input, self.normalized_shape, weight, self.eps)
+
     class GroupNorm(GGMLLayer, comfy.ops.manual_cast.GroupNorm):
         def forward_ggml_cast_weights(self, input):
             weight, bias = self.cast_bias_weight(input)
