@@ -6,6 +6,7 @@ import logging
 import comfy.ops
 import comfy.lora
 import comfy.model_management
+import comfy.model_patcher
 
 TORCH_COMPATIBLE_QTYPES = (None, gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16)
 
@@ -431,6 +432,98 @@ class GGMLOps(comfy.ops.manual_cast):
 import collections
 import comfy.float
 
+
+def is_ggml_pin_unsafe(module, param_name=None):
+    """
+    True if `module` holds mmap-backed / quantized GGML weights that must never
+    be handed to cudaHostRegister().
+
+    Two independent reasons pinning is impossible for these:
+      * the pages are read-only, file-backed (mmap) -> CUDA refuses to
+        page-lock them;
+      * GGMLTensor.shape reports the *dequantized* logical shape, so any
+        nbytes / vram_aligned_size() computation is several times larger than
+        the real quantized buffer, making the registration range run past the
+        end of the mapping.
+    """
+    if isinstance(module, GGMLLayer):
+        # Fast path: a GGML layer is unsafe as soon as any of its weights is
+        # still in quantized (mmap) form.
+        try:
+            if module.is_ggml_quantized():
+                return True
+        except Exception:
+            pass
+
+    names = (param_name,) if param_name else ("weight", "bias")
+    for name in names:
+        param = getattr(module, name, None)
+        if param is None:
+            continue
+        # `param` may be an nn.Parameter wrapping a GGMLTensor; unwrap.
+        inner = getattr(param, "data", param)
+        if isinstance(inner, GGMLTensor) or is_quantized(inner):
+            return True
+    return False
+
+
+def _install_pinned_memory_guard():
+    """
+    comfy has a SECOND, independent pinning path used by the dynamic/AIMDO
+    weight loader:
+
+        comfy/ops.py:226 -> comfy.pinned_memory.pin_memory(m, ...)
+
+    It sizes the host buffer with
+    `vram_aligned_size([module.weight, module.bias])`, which for a GGMLTensor
+    returns the dequantized size (~4x the real Q4_K buffer). The subsequent
+    cudaHostRegister() therefore always fails and logs "Pin error.", and every
+    failure additionally runs discard_cuda_async_error() -> a full CUDA
+    synchronize. With hundreds of layers this is both noisy and slow.
+
+    GGUF weights are dequantized per-layer straight onto CUDA at inference
+    time, so a pinned host staging buffer buys us nothing. Skip it.
+    """
+    try:
+        import comfy.pinned_memory as _pm
+    except Exception:
+        return
+    if getattr(_pm, "_gguf_guard_installed", False):
+        return
+
+    _orig_pin_memory = _pm.pin_memory
+    _orig_get_pin = _pm.get_pin
+
+    def pin_memory(module, subset="weights", size=None):
+        if is_ggml_pin_unsafe(module):
+            return
+        return _orig_pin_memory(module, subset=subset, size=size)
+
+    def get_pin(module, subset="weights"):
+        if is_ggml_pin_unsafe(module):
+            return None
+        return _orig_get_pin(module, subset=subset)
+
+    _pm.pin_memory = pin_memory
+    _pm.get_pin = get_pin
+    _pm._gguf_guard_installed = True
+
+    # comfy/ops.py does `import comfy.pinned_memory` and calls through the
+    # module attribute, so patching the module is enough. Guard anyway in case
+    # a future version imports the names directly.
+    try:
+        import comfy.ops as _ops
+        if getattr(_ops, "pin_memory", None) is _orig_pin_memory:
+            _ops.pin_memory = pin_memory
+        if getattr(_ops, "get_pin", None) is _orig_get_pin:
+            _ops.get_pin = get_pin
+    except Exception:
+        pass
+
+
+_install_pinned_memory_guard()
+
+
 class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
     """
     ModelPatcher subclass that handles patches on GGMLTensor (quantized) weights.
@@ -438,8 +531,16 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
     instead of applying them to the dequantized weight immediately.
     """
     patch_on_device = False
+    # Module-name prefixes of block-swap-owned blocks; these are excluded from
+    # mmap release so their GGUF pages stay file-backed and OS-reclaimable.
+    _blockswap_prefixes = ()
     mmap_released = False
     named_modules_to_munmap = {}
+    # name -> module, built once per instance by pin_weight_to_device so we
+    # don't rebuild dict(named_modules()) for every single weight key.
+    # Deliberately None here: a mutable class-level dict would be shared across
+    # every patcher instance (clone() swaps __class__ in place).
+    _gguf_module_cache = None
 
     @classmethod
     def clone(cls, model):
@@ -490,33 +591,144 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
                     p.patches = []
         return super().unpatch_model(device_to=device_to, unpatch_weights=unpatch_weights)
 
+    def _collect_blockswap_prefixes(self):
+        """Collect module-name prefixes owned by a block-swap container.
+
+        Block swappers (e.g. UniBlockSwap) replace a diffusion model's block
+        container with a custom nn.ModuleList that keeps the swap blocks on the
+        offload device and streams them to the compute device on demand.
+
+        Those blocks must NOT be munmap'd: the mmap'd GGUF pages are backed by
+        the model file and are reclaimable by the OS, whereas a
+        .to(load_device).to(offload_device) round trip reallocates them as
+        anonymous heap memory that is never reclaimed (and is subsequently
+        page-locked by pinning). For a 20GB model that turns essentially the
+        whole checkpoint into resident, unswappable RAM.
+
+        Returns a tuple of name prefixes such as ("blocks.12", "blocks.13", ...).
+        Empty when no block swapper is installed.
+        """
+        prefixes = []
+        try:
+            model = self.model
+            for name, module in model.named_modules():
+                non_swap = getattr(module, "non_swap_count", None)
+                total = getattr(module, "total_count", None)
+                # Duck-type the swap container rather than importing the
+                # block-swap package, which may not be installed.
+                if non_swap is None or total is None:
+                    continue
+                if not hasattr(module, "offload_swap_blocks"):
+                    continue
+                for idx in range(non_swap, total):
+                    prefixes.append(f"{name}.{idx}" if name else str(idx))
+        except Exception:
+            return ()
+        return tuple(prefixes)
+
+    @staticmethod
+    def _is_under_prefix(name, prefixes):
+        for p in prefixes:
+            if name == p or name.startswith(p + "."):
+                return True
+        return False
+
     def pin_weight_to_device(self, key):
-        op_key = key.rsplit('.', 1)[0]
-        if not self.mmap_released and op_key in self.named_modules_to_munmap:
-            self.named_modules_to_munmap[op_key].to(self.load_device).to(self.offload_device)
-            del self.named_modules_to_munmap[op_key]
+        # GGUF quantized weights live in the GGMLTensor (mmap-backed) view.
+        # They must NOT be materialised (dequantized) here: doing
+        # `m.to(load_device).to(offload_device)` on a GGMLTensor fully
+        # dequantizes the whole model into resident RAM -- this is exactly the
+        # 14G -> 57G memory blow-up observed at sampling time.
+        #
+        # The weights stay file-backed (OS-reclaimable) and are lazily
+        # dequantized per-layer by GGMLLayer.cast_bias_weight() onto the
+        # compute device (CUDA) at inference time, then discarded.
+        #
+        # We also must NOT let comfy try to cudaHostRegister() them:
+        #  * they are read-only, file-backed (mmap) pages, which CUDA refuses
+        #    to page-lock -> "Pin error." warnings;
+        #  * GGMLTensor.shape reports the *dequantized* logical shape, so
+        #    `tensor.nbytes` is far larger than the real quantized buffer and
+        #    the registration range would run past the mapping anyway.
+        # Every failed pin also runs discard_cuda_async_error(), which does a
+        # full CUDA synchronize -- hundreds of those noticeably slow loading.
+        # So: skip pinning entirely for quantized GGML weights.
+        if not self.mmap_released and key.rsplit('.', 1)[0] in self.named_modules_to_munmap:
+            del self.named_modules_to_munmap[key.rsplit('.', 1)[0]]
+
+        # Resolve the owning module directly instead of going through
+        # get_key_weight() (which raises for keys like a missing ".bias").
+        module_name, _, param_name = key.rpartition('.')
+        cache = self.__dict__.get("_gguf_module_cache")
+        if cache is None:
+            cache = dict(self.model.named_modules())
+            self._gguf_module_cache = cache
+        module = cache.get(module_name)
+
+        if module is not None and is_ggml_pin_unsafe(module, param_name):
+            return  # not pinnable: mmap-backed / quantized
+
         super().pin_weight_to_device(key)
 
     def load(self, *args, force_patch_weights=False, **kwargs):
+        # GGUF quantized weights are mmap-backed GGMLTensors. They must stay
+        # on disk and be lazily dequantized per-layer onto the compute device
+        # (CUDA) at inference time, then discarded -- never materialized into
+        # resident RAM. To guarantee that, we force the lowvram/offloaded path
+        # (every module goes through pin_weight_to_device, which now keeps the
+        # mmap view intact) instead of the `load_completely` path whose
+        # `m.to(device_to)` would dequantize layers into RAM.
+        # Callers may pass `device_to` / `lowvram_model_memory` positionally
+        # (e.g. ModelPatcher.partially_load -> self.load(device_to, ...)).
+        # Normalize them into kwargs so we never end up passing the same
+        # argument twice to super().load().
+        args = list(args)
+        for pos_name in ("device_to", "lowvram_model_memory"):
+            if not args:
+                break
+            kwargs[pos_name] = args.pop(0)
+        args = tuple(args)
+
+        if "lowvram_model_memory" not in kwargs:
+            # Force the lazy/offloaded path: a tiny budget (< any single
+            # module) makes every module take the lowvram branch, where the
+            # weight stays an mmap-backed GGMLTensor and is dequantized per
+            # layer onto CUDA at inference time. This avoids the
+            # `load_completely` path whose `m.to(device_to)` would dequantize
+            # layers into host RAM.
+            kwargs["lowvram_model_memory"] = 1
+        # Make sure the one-shot `load_completely` branch, if it ever fires,
+        # dequantizes onto the GPU rather than into host RAM.
+        if kwargs.get("device_to") is None:
+            kwargs["device_to"] = self.load_device
         if not self.mmap_released:
             self.named_modules_to_munmap = dict(self.model.named_modules())
-        super().load(*args, force_patch_weights=True, **kwargs)
+            self._blockswap_prefixes = self._collect_blockswap_prefixes()
+        super().load(force_patch_weights=force_patch_weights, *args, **kwargs)
+        # NOTE: The previous mmap-release block below materialized every
+        # GGMLLayer by calling `m.to(load_device).to(offload_device)`. For a
+        # GGUF (quantized) model this triggers a full dequantization of ALL
+        # weights into resident bf16/fp16, turning the 24G mmap-backed model
+        # into ~43G+ of anonymous RAM -- exactly the 14G->57G blowup seen at
+        # sampling time. GGUF weights are meant to stay mmap-backed and be
+        # lazily dequantized per-layer by GGMLLayer.cast_bias_weight() at
+        # inference time, so we must NOT materialize them here.
+        #
+        # The block-swap path (UniBlockSwap) is handled separately by keeping
+        # its tensors mmap-backed (see _collect_blockswap_prefixes /
+        # pin_weight_to_device), which is safe because those pages stay
+        # file-backed and OS-reclaimable.
         if not self.mmap_released:
-            linked = []
-            if kwargs.get("lowvram_model_memory", 0) > 0:
-                for n, m in self.named_modules_to_munmap.items():
-                    if hasattr(m, "weight") and getattr(m.weight, "device", None) == self.offload_device:
-                        linked.append((n, m))
-                        continue
-                    if hasattr(m, "bias") and getattr(m.bias, "device", None) == self.offload_device:
-                        linked.append((n, m))
-                        continue
-            if linked and self.load_device != self.offload_device:
-                logging.info(f"Releasing mmap ({len(linked)} tensors)")
-                for n, m in linked:
-                    m.to(self.load_device).to(self.offload_device)
+            swap_prefixes = getattr(self, "_blockswap_prefixes", ())
+            skipped = sum(
+                1 for n, m in self.named_modules_to_munmap.items()
+                if self._is_under_prefix(n, swap_prefixes)
+            )
+            if skipped:
+                logging.info(f"Keeping mmap for {skipped} block-swap tensors")
             self.mmap_released = True
             self.named_modules_to_munmap = {}
+            self._blockswap_prefixes = ()
 
     def clone(self, *args, **kwargs):
         src_cls = self.__class__
@@ -526,6 +738,7 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         self.__class__ = src_cls
         n.patch_on_device = getattr(self, "patch_on_device", False)
         n.mmap_released = getattr(self, "mmap_released", False)
+        n._blockswap_prefixes = getattr(self, "_blockswap_prefixes", ())
         if src_cls != GGUFModelPatcher:
             n.size = 0
         return n
