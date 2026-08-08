@@ -1,5 +1,6 @@
 
 import os
+import gc
 import torch
 import warnings
 import folder_paths
@@ -102,7 +103,21 @@ def safe_state_dict_load(model, state_dict, assign):
         if k in model._parameters:
             existing = model._parameters[k]
             try:
-                if assign and existing.is_meta:
+                # Reference-mount quantized tensors instead of copying them.
+                #
+                # existing.data.copy_(v) writes into the full-size bf16 tensor
+                # that model_config.get_model() pre-allocated, which forces a
+                # dequantization of every GGUF tensor at load time and keeps the
+                # whole checkpoint resident in RAM at full precision -- the Q4
+                # size advantage is lost entirely.
+                #
+                # set_attr_param() wraps v in nn.Parameter without copying, so
+                # the GGMLTensor subclass (and its quantized storage) survives.
+                # GGMLLayer.cast_bias_weight() then dequantizes per-layer on
+                # demand at inference time, which is the intended design.
+                # The pre-allocated bf16 tensor loses its last reference here
+                # and is reclaimed by GC.
+                if is_quantized(v) or (assign and existing.is_meta):
                     comfy.utils.set_attr_param(model, k, v)
                 else:
                     existing.data.copy_(v)
@@ -156,6 +171,12 @@ def safe_state_dict_load(model, state_dict, assign):
         logging.warning(f"Safe load: {success} OK, {fail} skipped")
 
     for k, v in state_dict.items():
+        # Quantized tensors were reference-mounted above and legitimately have
+        # a packed shape that differs from the unquantized parameter shape.
+        # Do NOT "fix" them here: .to(dtype=float16) would dequantize and
+        # materialise the full-precision tensor, reintroducing the RAM blowup.
+        if is_quantized(v):
+            continue
         if k in model._parameters:
             existing = model._parameters[k]
             if existing.shape != v.shape:
@@ -231,6 +252,12 @@ def load_gguf_model(sd, ops=None):
 
     target = model.diffusion_model
     safe_state_dict_load(target, sd, assign=patcher.is_dynamic())
+
+    # The bf16 tensors pre-allocated by get_model() were replaced by
+    # reference-mounted GGMLTensors and are now unreferenced. Collect so the
+    # freed memory is actually returned rather than lingering in the allocator.
+    # (The caller drops its own `sd` reference right after this returns.)
+    gc.collect()
 
     return patcher
 
