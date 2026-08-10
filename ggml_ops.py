@@ -7,6 +7,7 @@ import comfy.ops
 import comfy.lora
 import comfy.model_management
 import comfy.model_patcher
+import uuid
 
 TORCH_COMPATIBLE_QTYPES = (None, gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16)
 
@@ -542,6 +543,15 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
     # every patcher instance (clone() swaps __class__ in place).
     _gguf_module_cache = None
 
+    # LoRA patches for *quantized* GGUF weights live here instead of self.patches.
+    # comfy's lowvram path iterates self.patches to build LowVramPatch objects
+    # that apply the patch onto a throwaway dequant copy. For GGUF that copy is
+    # discarded by block-swap's `p.data = orig` restore, silently dropping the
+    # LoRA. Keeping quantized-weight patches out of self.patches stops comfy from
+    # building LowVramPatch for them, so they stay mounted on the mmap-backed
+    # GGMLTensor (.patches) and survive swap restores.
+    _ggml_patches = None
+
     @classmethod
     def clone(cls, model):
         """Convert a regular ModelPatcher to GGUFModelPatcher (like City96)."""
@@ -554,15 +564,83 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
             n.size = 0
         return n
 
+    def add_patches(self, patches, strength_patch=1.0, strength_model=1.0):
+        """Like ModelPatcher.add_patches, but quantized GGUF weights keep their
+        LoRA off comfy's lowvram path.
+
+        Quantized keys: store in self._ggml_patches and apply immediately via
+        patch_weight_to_device() (which mounts the patch on the mmap GGMLTensor).
+        Non-quantized keys (F32/F16): delegate to the parent implementation so
+        comfy's normal LowVramPatch machinery handles them.
+        """
+        if self._ggml_patches is None:
+            self._ggml_patches = {}
+        applied = []
+        # Split patches into quantized vs torch-compatible so each goes the right way.
+        quant_keys = []
+        torch_keys = {}
+        model_sd_keys = set(self.model_state_dict().keys())
+        for k in patches:
+            offset = None
+            function = None
+            if isinstance(k, str):
+                key = k
+            else:
+                offset = k[1]
+                key = k[0]
+                if len(k) > 2:
+                    function = k[2]
+            if key not in model_sd_keys:
+                continue
+            weight = comfy.utils.get_attr(self.model, key)
+            if is_quantized(weight):
+                quant_keys.append(k)
+                current = self._ggml_patches.get(key, [])
+                current.append((strength_patch, patches[k], strength_model, offset, function))
+                self._ggml_patches[key] = current
+                applied.append(k)
+            else:
+                torch_keys[k] = patches[k]
+
+        # Apply quantized patches onto the mmap tensor right now.
+        for k in quant_keys:
+            if isinstance(k, str):
+                key = k
+            else:
+                key = k[0]
+            try:
+                self.patch_weight_to_device(key)
+            except Exception as e:
+                logging.warning(f"GGUF LoRA apply failed for {key}: {e}")
+
+        if torch_keys:
+            applied += super().add_patches(torch_keys, strength_patch, strength_model)
+        self.patches_uuid = uuid.uuid4()
+        return applied
+
     def patch_weight_to_device(self, key, device_to=None, inplace_update=False):
-        if key not in self.patches:
+        # Patches may come from either comfy's self.patches (non-quantized) or our
+        # own self._ggml_patches (quantized, kept off the lowvram path).
+        if key not in self.patches and (self._ggml_patches is None or key not in self._ggml_patches):
             return
+        patches = self.patches.get(key, []) + (self._ggml_patches.get(key, []) if self._ggml_patches else [])
         weight = comfy.utils.get_attr(self.model, key)
-        patches = self.patches[key]
         if is_quantized(weight):
-            out_weight = weight.to(device_to)
             patches = move_patch_to_device(patches,
                 self.load_device if self.patch_on_device else self.offload_device)
+            # CRITICAL: mount the patch on the ORIGINAL mmap-backed GGMLTensor
+            # (the `weight` we were given), not only on the dequantized copy.
+            # Block-swap restores swapped blocks with `p.data = orig` where
+            # `orig` is that very mmap tensor; if the patch lived only on the
+            # dequant copy, the swap-restore would point the parameter back at a
+            # patchless mmap tensor and the LoRA would silently stop applying.
+            # GGMLTensor.to() copies `.patches` onto the dequant copy too, so
+            # both the on-disk tensor and the compute copy stay LoRA-live.
+            try:
+                weight.patches = [(patches, key)]
+            except Exception:
+                pass
+            out_weight = weight.to(device_to)
             out_weight.patches = [(patches, key)]
         else:
             inplace_update = self.weight_inplace_update or inplace_update
@@ -589,6 +667,8 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
                 patches = getattr(p, "patches", [])
                 if patches:
                     p.patches = []
+        if self._ggml_patches:
+            self._ggml_patches = {}
         return super().unpatch_model(device_to=device_to, unpatch_weights=unpatch_weights)
 
     def _collect_blockswap_prefixes(self):
@@ -739,6 +819,9 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         n.patch_on_device = getattr(self, "patch_on_device", False)
         n.mmap_released = getattr(self, "mmap_released", False)
         n._blockswap_prefixes = getattr(self, "_blockswap_prefixes", ())
+        # Carry over any quantized-weight LoRA patches so a clone (used by the
+        # LoraLoader node) keeps applying them.
+        n._ggml_patches = (getattr(self, "_ggml_patches", None) or {}).copy()
         if src_cls != GGUFModelPatcher:
             n.size = 0
         return n
