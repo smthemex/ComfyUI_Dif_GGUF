@@ -2,11 +2,12 @@
 Easy quant comfyUI origin models to gguf , and esay use it, save more disk...
 
 # Tips
-* fix lora unuseful's error,修复lora失效的bug
-* fix high Vram error，修复高内存占用的bug
-* add gguf clip support
-* find it in model/loader,replace the original unet_loader to gguf_loader
-* 节点在模型/加载目录下,对于大部分单unet加载的,替换原始unet加载器为gguf加载器即可,hidream-O1 暂时未支持 
+* 联动swap插件，功能性修复，Linkage uniblockswap node, functional repair  
+* ~~fix lora unuseful's error,修复lora失效的bug~~
+* ~~fix high Vram error，修复高内存占用的bug~~
+* ~~add gguf clip support~~
+* ~~find it in model/loader,replace the original unet_loader to gguf_loader~~
+* ~~节点在模型/加载目录下,对于大部分单unet加载的,替换原始unet加载器为gguf加载器即可,hidream-O1 暂时未支持~~ 
 
 1.Installation  
 ----
