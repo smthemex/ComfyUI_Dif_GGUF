@@ -294,13 +294,28 @@ class GGMLLayer(torch.nn.Module):
             return self.ggml_load_from_state_dict(state_dict, prefix, *args, **kwargs)
         return super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
+    @staticmethod
+    def _restore_ggml_attrs(param, src):
+        """nn.Parameter(src) on a Tensor subclass does not run __init__, so
+        _make_subclass drops tensor_type / tensor_shape / patches. Re-attach
+        them from the source GGMLTensor when missing so that is_quantized()
+        and external block-swap tooling can identify the param reliably."""
+        for attr in ("tensor_type", "tensor_shape", "patches"):
+            if not hasattr(param, attr):
+                try:
+                    setattr(param, attr, getattr(src, attr, None))
+                except Exception:
+                    pass
+
     def ggml_load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
         prefix_len = len(prefix)
         for k, v in state_dict.items():
             if k[prefix_len:] == "weight":
                 self.weight = torch.nn.Parameter(v, requires_grad=False)
+                self._restore_ggml_attrs(self.weight, v)
             elif k[prefix_len:] == "bias" and v is not None:
                 self.bias = torch.nn.Parameter(v, requires_grad=False)
+                self._restore_ggml_attrs(self.bias, v)
             else:
                 unexpected_keys.append(k)
         if self.weight is None and isinstance(self, torch.nn.Linear):
